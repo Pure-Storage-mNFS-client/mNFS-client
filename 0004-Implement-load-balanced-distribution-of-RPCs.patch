@@ -1,0 +1,347 @@
+From 9f8ae2cf7ca7f6499c692bad55dbd781cdd7b688 Mon Sep 17 00:00:00 2001
+From: Bennett Amodio <bamodio@purestorage.com>
+Date: Mon, 11 Dec 2017 20:11:10 +0000
+Subject: [PATCH 4/4] Implement load-balanced distribution of RPCs
+
+---
+ fs/nfs/client.c                      |  6 +++-
+ fs/nfs/internal.h                    |  2 ++
+ fs/nfs/nfs4client.c                  | 11 +++++--
+ fs/nfs/super.c                       |  9 ++++++
+ include/linux/nfs_fs_sb.h            |  1 +
+ include/linux/sunrpc/clnt.h          |  3 ++
+ include/linux/sunrpc/xprtmultipath.h |  4 +++
+ net/sunrpc/clnt.c                    | 11 ++++++-
+ net/sunrpc/xprtmultipath.c           | 56 ++++++++++++++++++++++++++++++++++++
+ 9 files changed, 98 insertions(+), 5 deletions(-)
+
+diff --git a/fs/nfs/client.c b/fs/nfs/client.c
+index 73ae8f8..4f11f11 100644
+--- a/fs/nfs/client.c
++++ b/fs/nfs/client.c
+@@ -181,6 +181,7 @@ struct nfs_client *nfs_alloc_client(const struct nfs_client_initdata *cl_init)
+ 
+ 	clp->cl_proto = cl_init->proto;
+ 	clp->cl_nconnect = cl_init->nconnect;
++	clp->cl_xps_mode = cl_init->xps_mode;
+ 	clp->cl_net = get_net(cl_init->net);
+ 
+ 	cred = rpc_lookup_machine_cred("*");
+@@ -505,6 +506,7 @@ int nfs_create_rpc_client(struct nfs_client *clp,
+ 		.net		= clp->cl_net,
+ 		.protocol	= clp->cl_proto,
+ 		.nconnect	= clp->cl_nconnect,
++		.xps_mode	= clp->cl_xps_mode,
+ 		.address	= (struct sockaddr *)&clp->cl_addr,
+ 		.addrsize	= clp->cl_addrlen,
+ 		.timeout	= cl_init->timeparms,
+@@ -676,8 +678,10 @@ static int nfs_init_server(struct nfs_server *server,
+ 
+ 	dprintk("--> nfs_init_server()\n");
+ 
+-	if (data->nfs_server.protocol == XPRT_TRANSPORT_TCP)
++	if (data->nfs_server.protocol == XPRT_TRANSPORT_TCP) {
+ 		cl_init.nconnect = data->nfs_server.nconnect;
++		cl_init.xps_mode = data->nfs_server.xps_mode;
++	}
+ 
+ 	nfs_init_timeout_values(&timeparms, data->nfs_server.protocol,
+ 			data->timeo, data->retrans);
+diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
+index 239a6d4..9705d0a 100644
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -78,6 +78,7 @@ struct nfs_client_initdata {
+ 	int proto;
+ 	u32 minorversion;
+ 	unsigned int nconnect;
++	unsigned int xps_mode;
+ 	struct net *net;
+ 	const struct rpc_timeout *timeparms;
+ };
+@@ -119,6 +120,7 @@ struct nfs_parsed_mount_data {
+ 		int			port;
+ 		unsigned short		protocol;
+ 		unsigned short		nconnect;
++		unsigned int		xps_mode;
+ 	} nfs_server;
+ 
+ 	struct security_mnt_opts lsm_opts;
+diff --git a/fs/nfs/nfs4client.c b/fs/nfs/nfs4client.c
+index 770e084..60622ea 100644
+--- a/fs/nfs/nfs4client.c
++++ b/fs/nfs/nfs4client.c
+@@ -906,7 +906,7 @@ static int nfs4_set_client(struct nfs_server *server,
+ 		const char *ip_addr,
+ 		rpc_authflavor_t authflavour,
+ 		int proto, const struct rpc_timeout *timeparms,
+-		u32 minorversion, unsigned int nconnect,
++		u32 minorversion, unsigned int nconnect, unsigned int xps_mode,
+ 		struct net *net)
+ {
+ 	struct nfs_client_initdata cl_init = {
+@@ -925,8 +925,10 @@ static int nfs4_set_client(struct nfs_server *server,
+ 
+ 	dprintk("--> nfs4_set_client()\n");
+ 
+-	if (minorversion > 0 && proto == XPRT_TRANSPORT_TCP)
++	if (minorversion > 0 && proto == XPRT_TRANSPORT_TCP) {
+ 		cl_init.nconnect = nconnect;
++		cl_init.xps_mode = xps_mode;
++	}
+ 	if (server->flags & NFS_MOUNT_NORESVPORT)
+ 		set_bit(NFS_CS_NORESVPORT, &cl_init.init_flags);
+ 	if (server->options & NFS_OPTION_MIGRATION)
+@@ -1137,6 +1139,7 @@ static int nfs4_init_server(struct nfs_server *server,
+ 			&timeparms,
+ 			data->minorversion,
+ 			data->nfs_server.nconnect,
++			data->nfs_server.xps_mode,
+ 			data->net);
+ 	if (error < 0)
+ 		goto error;
+@@ -1235,6 +1238,7 @@ struct nfs_server *nfs4_create_referral_server(struct nfs_clone_mount *data,
+ 				parent_server->client->cl_timeout,
+ 				parent_client->cl_mvops->minor_version,
+ 				parent_client->cl_nconnect,
++				parent_client->cl_xps_mode,
+ 				parent_client->cl_net);
+ 	if (error < 0)
+ 		goto error;
+@@ -1345,7 +1349,8 @@ int nfs4_update_server(struct nfs_server *server, const char *hostname,
+ 				clp->cl_rpcclient->cl_auth->au_flavor,
+ 				clp->cl_proto, clnt->cl_timeout,
+ 				clp->cl_minorversion,
+-				clp->cl_nconnect, net);
++				clp->cl_nconnect,
++				clp->cl_xps_mode, net);
+ 	nfs_put_client(clp);
+ 	if (error != 0) {
+ 		nfs_server_insert_lists(server);
+diff --git a/fs/nfs/super.c b/fs/nfs/super.c
+index 6732f70..35a10f1 100644
+--- a/fs/nfs/super.c
++++ b/fs/nfs/super.c
+@@ -110,6 +110,7 @@ enum {
+ 	Opt_sec, Opt_proto, Opt_mountproto, Opt_mounthost,
+ 	Opt_addr, Opt_mountaddr, Opt_clientaddr,
+ 	Opt_nconnect,
++	Opt_xpsmode,
+ 	Opt_lookupcache,
+ 	Opt_fscache_uniq,
+ 	Opt_local_lock,
+@@ -183,6 +184,7 @@ static const match_table_t nfs_mount_option_tokens = {
+ 	{ Opt_mountaddr, "mountaddr=%s" },
+ 
+ 	{ Opt_nconnect, "nconnect=%s" },
++	{ Opt_xpsmode, "xpsmode=%s" },
+ 
+ 	{ Opt_lookupcache, "lookupcache=%s" },
+ 	{ Opt_fscache_uniq, "fsc=%s" },
+@@ -670,6 +672,8 @@ static void nfs_show_mount_options(struct seq_file *m, struct nfs_server *nfss,
+ 	rcu_read_unlock();
+ 	if (clp->cl_nconnect > 0)
+ 		seq_printf(m, ",nconnect=%u", clp->cl_nconnect);
++	if (clp->cl_xps_mode)
++		seq_printf(m, ",xpsmode=%u", clp->cl_xps_mode);
+ 	if (version == 4) {
+ 		if (nfss->port != NFS_PORT)
+ 			seq_printf(m, ",port=%u", nfss->port);
+@@ -1549,6 +1553,11 @@ static int nfs_parse_mount_options(char *raw,
+ 				goto out_invalid_value;
+ 			mnt->nfs_server.nconnect = option;
+ 			break;
++		case Opt_xpsmode:
++			if (nfs_get_option_ul_bound(args, &option, 1, 2))
++				goto out_invalid_value;
++			mnt->nfs_server.xps_mode = option;
++			break;
+ 		case Opt_lookupcache:
+ 			string = match_strdup(args);
+ 			if (string == NULL)
+diff --git a/include/linux/nfs_fs_sb.h b/include/linux/nfs_fs_sb.h
+index b7164d4..f52ee1f 100644
+--- a/include/linux/nfs_fs_sb.h
++++ b/include/linux/nfs_fs_sb.h
+@@ -56,6 +56,7 @@ struct nfs_client {
+ 
+ 	u32			cl_minorversion;/* NFSv4 minorversion */
+ 	unsigned int		cl_nconnect;	/* Number of connections */
++	unsigned int		cl_xps_mode;	/* xprt switch mode */
+ 	struct rpc_cred		*cl_machine_cred;
+ 
+ #if IS_ENABLED(CONFIG_NFS_V4)
+diff --git a/include/linux/sunrpc/clnt.h b/include/linux/sunrpc/clnt.h
+index c711c28..0eafd8b 100644
+--- a/include/linux/sunrpc/clnt.h
++++ b/include/linux/sunrpc/clnt.h
+@@ -54,6 +54,8 @@ struct rpc_clnt {
+ 				cl_autobind : 1,/* use getport() */
+ 				cl_chatty   : 1;/* be verbose */
+ 
++	unsigned int cl_xps_mode; /* xprt switch mode */
++
+ 	struct rpc_rtt *	cl_rtt;		/* RTO estimator data */
+ 	const struct rpc_timeout *cl_timeout;	/* Timeout strategy */
+ 
+@@ -121,6 +123,7 @@ struct rpc_create_args {
+ 	u32			version;
+ 	rpc_authflavor_t	authflavor;
+ 	u32			nconnect;
++	unsigned int		xps_mode;
+ 	unsigned long		flags;
+ 	char			*client_name;
+ 	struct svc_xprt		*bc_xprt;	/* NFSv4.1 backchannel */
+diff --git a/include/linux/sunrpc/xprtmultipath.h b/include/linux/sunrpc/xprtmultipath.h
+index 507418c..d704804 100644
+--- a/include/linux/sunrpc/xprtmultipath.h
++++ b/include/linux/sunrpc/xprtmultipath.h
+@@ -8,6 +8,9 @@
+ #ifndef _NET_SUNRPC_XPRTMULTIPATH_H
+ #define _NET_SUNRPC_XPRTMULTIPATH_H
+ 
++#define XPS_MODE_ROUNDROBIN	(1U)
++#define XPS_MODE_LOADBALANCE	(2U)
++
+ struct rpc_xprt_iter_ops;
+ struct rpc_xprt_switch {
+ 	spinlock_t		xps_lock;
+@@ -44,6 +47,7 @@ extern struct rpc_xprt_switch *xprt_switch_get(struct rpc_xprt_switch *xps);
+ extern void xprt_switch_put(struct rpc_xprt_switch *xps);
+ 
+ extern void rpc_xprt_switch_set_roundrobin(struct rpc_xprt_switch *xps);
++extern void rpc_xprt_switch_set_loadbalance(struct rpc_xprt_switch *xps);
+ 
+ extern void rpc_xprt_switch_add_xprt(struct rpc_xprt_switch *xps,
+ 		struct rpc_xprt *xprt);
+diff --git a/net/sunrpc/clnt.c b/net/sunrpc/clnt.c
+index 134d02e..16c151b 100644
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@ -588,6 +588,11 @@ struct rpc_clnt *rpc_create(struct rpc_create_args *args)
+ 	if (IS_ERR(clnt) || args->nconnect <= 1)
+ 		goto out;
+ 
++	if (args->xps_mode)
++		clnt->cl_xps_mode = args->xps_mode;
++	else
++		clnt->cl_xps_mode = XPS_MODE_LOADBALANCE;
++
+ 	for (i=0; i < args->nconnect - 1; i++) {
+ 		if (rpc_clnt_add_xprt(clnt, &xprtargs, NULL, NULL) < 0)
+ 			break;
+@@ -2737,7 +2742,11 @@ int rpc_clnt_add_xprt(struct rpc_clnt *clnt,
+ 	xprt->resvport = resvport;
+ 	xprt->max_reconnect_timeout = reconnect_timeout;
+ 
+-	rpc_xprt_switch_set_roundrobin(xps);
++	if (clnt->cl_xps_mode == XPS_MODE_LOADBALANCE)
++		rpc_xprt_switch_set_loadbalance(xps);
++	else
++		rpc_xprt_switch_set_roundrobin(xps);
++
+ 	if (setup) {
+ 		ret = setup(clnt, xps, xprt, data);
+ 		if (ret != 0)
+diff --git a/net/sunrpc/xprtmultipath.c b/net/sunrpc/xprtmultipath.c
+index 4a0bd0e..280f3de 100644
+--- a/net/sunrpc/xprtmultipath.c
++++ b/net/sunrpc/xprtmultipath.c
+@@ -36,6 +36,7 @@ typedef struct rpc_xprt *(*xprt_switch_find_xprt_t)(struct list_head *head,
+ static const struct rpc_xprt_iter_ops rpc_xprt_iter_singular;
+ static const struct rpc_xprt_iter_ops rpc_xprt_iter_roundrobin;
+ static const struct rpc_xprt_iter_ops rpc_xprt_iter_listall;
++static const struct rpc_xprt_iter_ops rpc_xprt_iter_loadbalance;
+ 
+ static void xprt_switch_add_xprt_locked(struct rpc_xprt_switch *xps,
+ 		struct rpc_xprt *xprt)
+@@ -183,6 +184,18 @@ void rpc_xprt_switch_set_roundrobin(struct rpc_xprt_switch *xps)
+ 		WRITE_ONCE(xps->xps_iter_ops, &rpc_xprt_iter_roundrobin);
+ }
+ 
++/**
++ * rpc_xprt_switch_set_loadbalance - Set a load-balancing policy on rpc_xprt_switch
++ * @xps: pointer to a struct rpc_xprt_switch
++ *
++ * Sets a load-balancing default policy for iterators acting on xps.
++ */
++void rpc_xprt_switch_set_loadbalance(struct rpc_xprt_switch *xps)
++{
++	if(READ_ONCE(xps->xps_iter_ops) != &rpc_xprt_iter_loadbalance)
++		WRITE_ONCE(xps->xps_iter_ops, &rpc_xprt_iter_loadbalance);
++}
++
+ static
+ const struct rpc_xprt_iter_ops *xprt_iter_ops(const struct rpc_xprt_iter *xpi)
+ {
+@@ -280,6 +293,22 @@ struct rpc_xprt *xprt_switch_find_next_entry(struct list_head *head,
+ }
+ 
+ static
++struct rpc_xprt *xprt_switch_find_first_avail_entry(struct list_head *head)
++{
++	struct rpc_xprt *pos, *avail = NULL;
++	unsigned short minimum = USHRT_MAX;
++
++	list_for_each_entry_rcu(pos, head, xprt_switch) {
++		unsigned short len = pos->pending.qlen;
++		if (len < minimum) {
++			minimum = len;
++			avail = pos;
++		}
++	}
++	return avail;
++}
++
++static
+ struct rpc_xprt *xprt_switch_set_next_cursor(struct list_head *head,
+ 		struct rpc_xprt **cursor,
+ 		xprt_switch_find_xprt_t find_next)
+@@ -325,6 +354,18 @@ struct rpc_xprt *xprt_switch_find_next_entry_roundrobin(struct list_head *head,
+ }
+ 
+ static
++struct rpc_xprt *xprt_switch_find_next_entry_loadbalance(struct list_head *head,
++		const struct rpc_xprt *cur)
++{
++	struct rpc_xprt *ret;
++
++	ret = xprt_switch_find_first_avail_entry(head);
++	if (ret != NULL)
++		return ret;
++	return xprt_switch_find_first_entry(head);
++}
++
++static
+ struct rpc_xprt *xprt_iter_next_entry_roundrobin(struct rpc_xprt_iter *xpi)
+ {
+ 	return xprt_iter_next_entry_multiple(xpi,
+@@ -332,6 +373,13 @@ struct rpc_xprt *xprt_iter_next_entry_roundrobin(struct rpc_xprt_iter *xpi)
+ }
+ 
+ static
++struct rpc_xprt *xprt_iter_next_entry_loadbalance(struct rpc_xprt_iter *xpi)
++{
++	return xprt_iter_next_entry_multiple(xpi,
++			xprt_switch_find_next_entry_loadbalance);
++}
++
++static
+ struct rpc_xprt *xprt_iter_next_entry_all(struct rpc_xprt_iter *xpi)
+ {
+ 	return xprt_iter_next_entry_multiple(xpi, xprt_switch_find_next_entry);
+@@ -504,3 +552,11 @@ const struct rpc_xprt_iter_ops rpc_xprt_iter_listall = {
+ 	.xpi_xprt = xprt_iter_current_entry,
+ 	.xpi_next = xprt_iter_next_entry_all,
+ };
++
++/* Policy for load-balancing iteration of entries in the rpc_xprt_switch */
++static
++const struct rpc_xprt_iter_ops rpc_xprt_iter_loadbalance = {
++	.xpi_rewind = xprt_iter_no_rewind,
++	.xpi_xprt = xprt_iter_current_entry,
++	.xpi_next = xprt_iter_next_entry_loadbalance,
++};
+-- 
+1.8.3.1
+
