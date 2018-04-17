@@ -17,3 +17,6 @@ xpsmode=1 means original round-robin and xpsmode=2 means better load-balancing m
 For example, 
 sudo mount -v -t nfs -overs=3,nconnect=16,xpsmode=2 REMOTE_FILESYSTEM LOCAL_DIRECTORY
 It will open 16 connections and use load-balancing to transfer data.
+
+If any questions, please contact Bennett Amodio <bamodio@purestorage.com>
+				 Jeff    Chang  <jechang@purestorage.com>
