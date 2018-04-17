@@ -1,0 +1,173 @@
+From 1ffe42fc72e5b69bbbcb22f04baa08005473aa55 Mon Sep 17 00:00:00 2001
+From: Bennett Amodio <bamodio@purestorage.com>
+Date: Mon, 11 Dec 2017 20:11:05 +0000
+Subject: [PATCH 3/4] Implement atomic shared XID
+
+---
+ include/linux/sunrpc/xprt.h | 16 ++++++++++++++-
+ net/sunrpc/clnt.c           |  6 +++++-
+ net/sunrpc/xprt.c           | 47 ++++++++++++++++++++++++++++++++++++---------
+ 3 files changed, 58 insertions(+), 11 deletions(-)
+
+diff --git a/include/linux/sunrpc/xprt.h b/include/linux/sunrpc/xprt.h
+index 1846113..ac21738 100644
+--- a/include/linux/sunrpc/xprt.h
++++ b/include/linux/sunrpc/xprt.h
+@@ -150,6 +150,11 @@ struct rpc_xprt_ops {
+ 				      unsigned int max_reqs);
+ };
+ 
++struct xprt_xid_mgr {
++	atomic_t	xid;		/* xid */
++	struct kref	refcount;	/* ref count */
++};
++
+ /*
+  * RPC transport identifiers
+  *
+@@ -228,7 +233,7 @@ struct rpc_xprt {
+ 	 */
+ 	spinlock_t		transport_lock;	/* lock transport info */
+ 	spinlock_t		reserve_lock;	/* lock slot table */
+-	u32			xid;		/* Next XID value to use */
++	struct xprt_xid_mgr *	xid_mgr;	/* XID manager */
+ 	struct rpc_task *	snd_task;	/* Task blocked in send */
+ 	struct svc_xprt		*bc_xprt;	/* NFSv4.1 backchannel */
+ #if defined(CONFIG_SUNRPC_BACKCHANNEL)
+@@ -301,9 +306,18 @@ struct xprt_create {
+ 	const char		*servername;
+ 	struct svc_xprt		*bc_xprt;	/* NFSv4.1 backchannel */
+ 	struct rpc_xprt_switch	*bc_xps;
++	struct xprt_xid_mgr *	xid_mgr;
+ 	unsigned int		flags;
+ };
+ 
++/*
++ * XID manager functions
++ */
++
++struct xprt_xid_mgr *	xprt_alloc_xid_mgr(void);
++unsigned int		xprt_xid_mgr_alloc_xid(struct xprt_xid_mgr *mgr);
++void 			xprt_release_xid_mgr(struct kref *ref);
++
+ struct xprt_class {
+ 	struct list_head	list;
+ 	int			ident;		/* XPRT_TRANSPORT identifier */
+diff --git a/net/sunrpc/clnt.c b/net/sunrpc/clnt.c
+index 57a9d73..134d02e 100644
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@ -568,6 +568,8 @@ struct rpc_clnt *rpc_create(struct rpc_create_args *args)
+ 		xprtargs.servername = servername;
+ 	}
+ 
++	xprtargs.xid_mgr = xprt_alloc_xid_mgr();
++
+ 	xprt = xprt_create_transport(&xprtargs);
+ 	if (IS_ERR(xprt))
+ 		return (struct rpc_clnt *)xprt;
+@@ -584,12 +586,14 @@ struct rpc_clnt *rpc_create(struct rpc_create_args *args)
+ 
+ 	clnt = rpc_create_xprt(args, xprt);
+ 	if (IS_ERR(clnt) || args->nconnect <= 1)
+-		return clnt;
++		goto out;
+ 
+ 	for (i=0; i < args->nconnect - 1; i++) {
+ 		if (rpc_clnt_add_xprt(clnt, &xprtargs, NULL, NULL) < 0)
+ 			break;
+ 	}
++out:
++	kref_put(&xprtargs.xid_mgr->refcount, xprt_release_xid_mgr);
+ 	return clnt;
+ }
+ EXPORT_SYMBOL_GPL(rpc_create);
+diff --git a/net/sunrpc/xprt.c b/net/sunrpc/xprt.c
+index bf14657..90158b0 100644
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@ -1220,12 +1220,7 @@ void xprt_retry_reserve(struct rpc_task *task)
+ 
+ static inline __be32 xprt_alloc_xid(struct rpc_xprt *xprt)
+ {
+-	return (__force __be32)xprt->xid++;
+-}
+-
+-static inline void xprt_init_xid(struct rpc_xprt *xprt)
+-{
+-	xprt->xid = prandom_u32();
++	return (__force __be32)xprt_xid_mgr_alloc_xid(xprt->xid_mgr);
+ }
+ 
+ static void xprt_request_init(struct rpc_task *task, struct rpc_xprt *xprt)
+@@ -1250,6 +1245,33 @@ static void xprt_request_init(struct rpc_task *task, struct rpc_xprt *xprt)
+ 			req, ntohl(req->rq_xid));
+ }
+ 
++/*
++ * XID manager functions
++ */
++
++struct xprt_xid_mgr *xprt_alloc_xid_mgr(void)
++{
++	struct xprt_xid_mgr *mgr;
++	mgr = kzalloc(sizeof(struct xprt_xid_mgr), GFP_KERNEL);
++	if (mgr == NULL)
++		return NULL;
++	atomic_set(&mgr->xid, prandom_u32());
++	kref_init(&mgr->refcount);
++	return mgr;
++}
++
++void xprt_release_xid_mgr(struct kref *ref)
++{
++	struct xprt_xid_mgr *mgr = container_of(ref,
++			struct xprt_xid_mgr, refcount);
++	kfree(mgr);
++}
++
++unsigned int xprt_xid_mgr_alloc_xid(struct xprt_xid_mgr *mgr)
++{
++	return atomic_inc_return(&mgr->xid);
++}
++
+ /**
+  * xprt_release - release an RPC request slot
+  * @task: task which is finished with the slot
+@@ -1325,8 +1347,6 @@ static void xprt_init(struct rpc_xprt *xprt, struct net *net)
+ 	rpc_init_priority_wait_queue(&xprt->sending, "xprt_sending");
+ 	rpc_init_priority_wait_queue(&xprt->backlog, "xprt_backlog");
+ 
+-	xprt_init_xid(xprt);
+-
+ 	xprt->xprt_net = get_net(net);
+ }
+ 
+@@ -1372,7 +1392,15 @@ found:
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 	xprt->servername = kstrdup(args->servername, GFP_KERNEL);
+-	if (xprt->servername == NULL) {
++
++	if (args->xid_mgr != NULL) {
++		kref_get(&args->xid_mgr->refcount);
++		xprt->xid_mgr = args->xid_mgr;
++	} else {
++		xprt->xid_mgr = xprt_alloc_xid_mgr();
++	}
++
++	if (xprt->servername == NULL || xprt->xid_mgr == NULL) {
+ 		xprt_destroy(xprt);
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+@@ -1406,6 +1434,7 @@ static void xprt_destroy(struct rpc_xprt *xprt)
+ 	rpc_destroy_wait_queue(&xprt->backlog);
+ 	cancel_work_sync(&xprt->task_cleanup);
+ 	kfree(xprt->servername);
++	kref_put(&xprt->xid_mgr->refcount, xprt_release_xid_mgr);
+ 	/*
+ 	 * Tear down transport state and free the rpc_xprt
+ 	 */
+-- 
+1.8.3.1
+
