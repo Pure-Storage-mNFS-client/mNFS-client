@@ -9,7 +9,7 @@ See reference: https://www.spinics.net/lists/linux-nfs/msg63368.html
 The last three patches allow multipathing in NFSv3 and improve performance with load balancing.
 
 There may be some conflicts which generate .rej files.
-But don't worry because those are easy to fix.
+But don't worry because those are easy fixes.
 
 After rebuilding the kernel, there are two more mount options. (nconnect, xpsmode)
 nconnect is the number of connections you want to open.
