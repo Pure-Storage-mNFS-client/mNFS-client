@@ -15,5 +15,5 @@ After rebuilding the kernel, there are two more mount options. (nconnect, xpsmod
 nconnect is the number of connections you want to open.
 xpsmode=1 means original round-robin and xpsmode=2 means better load-balancing mode.
 For example, 
-sudo mount -v -t nfs -overs=3,nconnect=16,xpsmode=2,nolock REMOTE_FILESYSTEM LOCAL_DIRECTORY
+sudo mount -v -t nfs -overs=3,nconnect=16,xpsmode=2 REMOTE_FILESYSTEM LOCAL_DIRECTORY
 It will open 16 connections and use load-balancing to transfer data.
