@@ -18,5 +18,7 @@ For example,
 sudo mount -v -t nfs -overs=3,nconnect=16,xpsmode=2 REMOTE_FILESYSTEM LOCAL_DIRECTORY
 It will open 16 connections and use load-balancing to transfer data.
 
+This is experimental code, that may or may not improve your performance based on your workload and usage. 
+Please use at your own risk.
 If any questions, please contact Bennett Amodio <bamodio@purestorage.com>
 				 Jeff    Chang  <jechang@purestorage.com>
